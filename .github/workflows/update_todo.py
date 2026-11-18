@@ -27,22 +27,19 @@ def run(cmd, check=True):
 
 
 def changed_py_files():
-    # Files introduced by the main-to-dev changes (main is an ancestor of dev).
     rc, out = run(f'git diff --name-only {BASE}...HEAD', check=False)
     files = [l for l in out.splitlines() if l.endswith('.py')]
     if not files:
         _, out = run(f'git diff --name-only {BASE} HEAD')
         files = [l for l in out.splitlines() if l.endswith('.py')]
-    # Never treat this helper's own files as project TODO changes.
     files = [f for f in files if not f.startswith('.github/')]
     return list(dict.fromkeys(files))
 
 
 def _render_comment(comment_text):
-    """Render a '# ... TODO ...' comment into the README message style."""
     body = comment_text.lstrip('#').strip()
-    body = body[len('TODO'):]     # drop the 'TODO' keyword
-    body = body.lstrip()          # drop spaces between TODO and (: or message
+    body = body[len('TODO'):]
+    body = body.lstrip()
     if body.startswith('('):
         m = re.match(r'^\(([^)]*)\)(.*)$', body, re.S)
         author = m.group(1)
@@ -85,12 +82,8 @@ def _extract_with_regex(path):
 
 
 def extract_todos(path):
-    """[(1-based line, rendered message)] for TODO comments; None if deleted.
-
-    Uses tokenize so '#' characters inside strings are not mistaken for comments.
-    """
     if not os.path.exists(path):
-        return None  # file was deleted
+        return None
     try:
         return _extract_with_tokenize(path)
     except Exception:
@@ -103,7 +96,6 @@ def main():
     for f in changed:
         print('  -', f)
 
-    # Complete TODO search across all .py files (informational; only changed files modify README).
     todo_files = []
     for root, dirs, files in os.walk('.'):
         dirs[:] = [d for d in dirs if d not in ('.git', '.github', '__pycache__', '.venv', 'venv')]
@@ -125,7 +117,6 @@ def main():
     original = open(README, encoding='utf-8', newline='').read()
     lines = original.split('\n')
 
-    # Locate the TODO section by exact heading; section ends at the next '## ' heading.
     h = None
     for i, l in enumerate(lines):
         if l.rstrip('\r') == TODO_HEADING:
@@ -153,7 +144,6 @@ def main():
     if first is None:
         raise SystemExit('No TODO items found in section; refusing to modify.')
 
-    # Existing groups, preserving current order.
     ordered_paths = []
     groups = OrderedDict()
     for j in range(first, last + 1):
@@ -167,17 +157,15 @@ def main():
             ordered_paths.append(p)
         groups[p].append((ln, msg))
 
-    # Baseline must already be ordered (file path, then increasing line within a file).
     for p in groups:
         lns = [x[0] for x in groups[p]]
         assert lns == sorted(lns), f'baseline lines not increasing for {p}'
     baseline_paths = list(groups.keys())
     assert baseline_paths == sorted(baseline_paths), 'baseline file order is not lexicographic'
 
-    # Apply ONLY TODO additions/removals/line updates introduced by the main-to-dev changes.
     for p in changed:
         its = extract_todos(p)
-        if its is None:  # file deleted on dev
+        if its is None:
             if p in groups:
                 del groups[p]
                 ordered_paths.remove(p)
@@ -199,7 +187,6 @@ def main():
                 if ln in old_map and old_map[ln] == msg:
                     print(f'  = {p}:{ln} message unchanged')
         else:
-            # New .py file introduced by the diff: insert lexicographically.
             groups[p] = its
             pos = 0
             while pos < len(ordered_paths) and ordered_paths[pos] < p:
@@ -207,18 +194,15 @@ def main():
             ordered_paths.insert(pos, p)
             print(f'ADD group: {p} ({len(its)} items)')
 
-    # Rebuild the contiguous item run. Untouched groups keep (path, line, message) exactly.
     new_item_lines = []
     for p in ordered_paths:
         its = sorted(groups[p], key=lambda x: x[0])
         for ln, msg in its:
             new_item_lines.append(f'- [ ] **{p}:{ln}** - {msg}'.rstrip())
 
-    # Splice only the item run; blank lines and everything else are preserved byte-for-byte.
     new_lines = lines[:first] + new_item_lines + lines[last + 1:]
     updated = '\n'.join(new_lines)
 
-    # Safety checks.
     assert updated != original or not changed, 'Expected README to change for changed .py files'
     assert TODO_HEADING in updated
     old_nonitems = [l for l in lines if not ITEM_RE.match(l)]
