@@ -1,0 +1,38 @@
+name: Update README TODO list
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Commit and push the updated README to dev (true) or dry-run and print the diff (false)'
+        required: true
+        default: false
+        type: boolean
+      base_ref:
+        description: 'Base ref to diff against (the main-to-dev change set)'
+        required: true
+        default: 'origin/main'
+        type: string
+permissions:
+  contents: write
+jobs:
+  update-todo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Show environment
+        run: |
+          git --version
+          git branch -a
+          git log --oneline -5
+      - name: Run TODO updater
+        env:
+          INPUT_PUSH: ${{ inputs.push }}
+          INPUT_BASE: ${{ inputs.base_ref }}
+        run: |
+          python .github/workflows/update_todo.py
