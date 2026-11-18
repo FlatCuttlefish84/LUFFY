@@ -2,11 +2,13 @@ import os
 import re
 import subprocess
 import sys
+import tokenize
 from collections import OrderedDict
 
 README = 'README.md'
 TODO_HEADING = '### \U0001f4dd Complete TODO List'
 ITEM_RE = re.compile(r'^- \[ \] \*\*(?P<path>.+):(?P<line>\d+)\*\* - (?P<msg>.*)$')
+TODO_RE = re.compile(r'\bTODO\b')
 
 PUSH = os.environ.get('INPUT_PUSH', 'false').strip().lower() == 'true'
 BASE = os.environ.get('INPUT_BASE', 'origin/main').strip() or 'origin/main'
@@ -31,60 +33,68 @@ def changed_py_files():
     if not files:
         _, out = run(f'git diff --name-only {BASE} HEAD')
         files = [l for l in out.splitlines() if l.endswith('.py')]
+    # Never treat this helper's own files as project TODO changes.
+    files = [f for f in files if not f.startswith('.github/')]
     return list(dict.fromkeys(files))
 
 
-def all_py_files():
-    found = []
-    for root, dirs, files in os.walk('.'):
-        dirs[:] = [d for d in dirs if d not in ('.git', '.github', '__pycache__', '.venv', 'venv')]
-        for f in files:
-            if f.endswith('.py'):
-                p = os.path.relpath(os.path.join(root, f), '.').replace('\\', '/')
-                if not p.startswith('.github/'):
-                    found.append(p)
-    return sorted(found)
+def _render_comment(comment_text):
+    """Render a '# ... TODO ...' comment into the README message style."""
+    body = comment_text.lstrip('#').strip()
+    body = body[len('TODO'):]     # drop the 'TODO' keyword
+    body = body.lstrip()          # drop spaces between TODO and (: or message
+    if body.startswith('('):
+        m = re.match(r'^\(([^)]*)\)(.*)$', body, re.S)
+        author = m.group(1)
+        rest = m.group(2)
+        had_colon = bool(rest.lstrip().startswith(':'))
+        rest = rest.lstrip()
+        if rest.startswith(':'):
+            rest = rest[1:].lstrip()
+        msg = rest.strip()
+        rendered = f'({author})' + (':' if had_colon else '')
+        if msg:
+            rendered += ' ' + msg
+        return rendered
+    else:
+        if body.startswith(':'):
+            body = body[1:]
+        return body.strip()
+
+
+def _extract_with_tokenize(path):
+    items = []
+    with tokenize.open(path) as fh:
+        for tok in tokenize.generate_tokens(fh.readline):
+            if tok.type == tokenize.COMMENT and TODO_RE.search(tok.string):
+                items.append((tok.start[0], _render_comment(tok.string)))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def _extract_with_regex(path):
+    items = []
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip('\r\n')
+            if re.match(r'^\s*#.*\bTODO\b', line):
+                idx = line.find('#')
+                items.append((lineno, _render_comment(line[idx:])))
+    items.sort(key=lambda x: x[0])
+    return items
 
 
 def extract_todos(path):
-    """Return [(line_number, rendered_message), ...] for TODO comments in a .py file, sorted by line."""
+    """[(1-based line, rendered message)] for TODO comments; None if deleted.
+
+    Uses tokenize so '#' characters inside strings are not mistaken for comments.
+    """
     if not os.path.exists(path):
         return None  # file was deleted
-    items = []
-    with open(path, encoding='utf-8') as fh:
-        for idx, raw in enumerate(fh, 1):
-            line = raw.rstrip('\n').rstrip('\r')
-            hashpos = line.find('#')
-            if hashpos < 0:
-                continue
-            comment = line[hashpos:]
-            if not re.search(r'\bTODO\b', comment):
-                continue
-            body = comment[1:]            # drop '#'
-            body = body.strip()
-            assert body.startswith('TODO'), (path, idx, body)
-            body = body[len('TODO'):]     # drop 'TODO'
-            body = body.lstrip()          # drop spaces between TODO and ( or message
-            if body.startswith('('):
-                m = re.match(r'^\(([^)]*)\)(.*)$', body)
-                author = m.group(1)
-                rest = m.group(2)
-                had_colon = bool(rest.lstrip().startswith(':'))
-                rest = rest.lstrip()
-                if rest.startswith(':'):
-                    rest = rest[1:].lstrip()
-                msg = rest.strip()
-                rendered = f'({author})' + (':' if had_colon else '')
-                if msg:
-                    rendered += ' ' + msg
-            else:
-                t = body
-                if t.startswith(':'):
-                    t = t[1:]
-                rendered = t.strip()
-            items.append((idx, rendered))
-    items.sort(key=lambda x: x[0])
-    return items
+    try:
+        return _extract_with_tokenize(path)
+    except Exception:
+        return _extract_with_regex(path)
 
 
 def main():
@@ -93,10 +103,21 @@ def main():
     for f in changed:
         print('  -', f)
 
-    pyfiles = all_py_files()
-    print(f'Searched all {len(pyfiles)} .py files in the repository for TODOs.')
-    for f in pyfiles:
-        print('    *', f)
+    # Complete TODO search across all .py files (informational; only changed files modify README).
+    todo_files = []
+    for root, dirs, files in os.walk('.'):
+        dirs[:] = [d for d in dirs if d not in ('.git', '.github', '__pycache__', '.venv', 'venv')]
+        for fn in files:
+            if not fn.endswith('.py'):
+                continue
+            p = os.path.relpath(os.path.join(root, fn), '.').replace('\\', '/')
+            its = extract_todos(p)
+            if its:
+                todo_files.append((p, len(its)))
+    todo_files.sort()
+    print(f'Searched all .py files; {len(todo_files)} contain TODO comments:')
+    for p, n in todo_files:
+        print(f'    * {p} ({n})')
 
     if not os.path.exists(README):
         raise SystemExit(f'{README} not found')
@@ -146,14 +167,14 @@ def main():
             ordered_paths.append(p)
         groups[p].append((ln, msg))
 
-    # Baseline must already be ordered (file path, then increasing line).
+    # Baseline must already be ordered (file path, then increasing line within a file).
     for p in groups:
         lns = [x[0] for x in groups[p]]
         assert lns == sorted(lns), f'baseline lines not increasing for {p}'
     baseline_paths = list(groups.keys())
     assert baseline_paths == sorted(baseline_paths), 'baseline file order is not lexicographic'
 
-    # Apply ONLY TODO additions/removals/line updates from the main-to-dev changes.
+    # Apply ONLY TODO additions/removals/line updates introduced by the main-to-dev changes.
     for p in changed:
         its = extract_todos(p)
         if its is None:  # file deleted on dev
@@ -178,7 +199,7 @@ def main():
                 if ln in old_map and old_map[ln] == msg:
                     print(f'  = {p}:{ln} message unchanged')
         else:
-            # New file introduced by the diff: insert lexicographically.
+            # New .py file introduced by the diff: insert lexicographically.
             groups[p] = its
             pos = 0
             while pos < len(ordered_paths) and ordered_paths[pos] < p:
@@ -186,14 +207,14 @@ def main():
             ordered_paths.insert(pos, p)
             print(f'ADD group: {p} ({len(its)} items)')
 
-    # Rebuild the contiguous item run; untouched groups keep their exact text via (path,line,msg).
+    # Rebuild the contiguous item run. Untouched groups keep (path, line, message) exactly.
     new_item_lines = []
     for p in ordered_paths:
         its = sorted(groups[p], key=lambda x: x[0])
         for ln, msg in its:
-            new_item_lines.append(f'- [ ] **{p}:{ln}** - {msg}')
+            new_item_lines.append(f'- [ ] **{p}:{ln}** - {msg}'.rstrip())
 
-    # Splice only the item run; blank lines and everything else are preserved.
+    # Splice only the item run; blank lines and everything else are preserved byte-for-byte.
     new_lines = lines[:first] + new_item_lines + lines[last + 1:]
     updated = '\n'.join(new_lines)
 
